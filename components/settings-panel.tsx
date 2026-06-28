@@ -2,6 +2,7 @@
 
 import { useTradeStore } from '@/store/trade-store'
 import { useFormatCurrency } from '@/hooks/use-currency'
+import { useDebouncedCallback } from '@/hooks/use-debounced-callback'
 import type { UserSettings } from '@/lib/types'
 import { SUPPORTED_CURRENCIES, SUPPORTED_LOCALES } from '@/lib/types'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
@@ -31,8 +32,32 @@ import {
   Settings2,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { cn } from '@/lib/utils'
+
+// Numeric settings fields that get debounced text inputs
+type NumericSettingKey =
+  | 'accountSize'
+  | 'monthlyProfitTarget'
+  | 'dailyRiskLimit'
+  | 'weeklyRiskLimit'
+  | 'maxTradesPerDay'
+  | 'minRiskReward'
+  | 'streakTarget'
+
+// Mirrors the server-side Zod schema bounds in /api/settings/route.ts.
+// Used to avoid firing a debounced save with a value the API will reject —
+// e.g. a momentary "0" while the user is clearing/retyping a field that
+// requires min(1) or min(0.5).
+const NUMERIC_BOUNDS: Record<NumericSettingKey, { min: number; max: number }> = {
+  accountSize: { min: 0, max: 100_000_000 },
+  monthlyProfitTarget: { min: 0, max: 100_000_000 },
+  dailyRiskLimit: { min: 1, max: 100 },
+  weeklyRiskLimit: { min: 1, max: 100 },
+  maxTradesPerDay: { min: 1, max: 50 },
+  minRiskReward: { min: 0.5, max: 10 },
+  streakTarget: { min: 1, max: 365 },
+}
 
 export function SettingsPanel() {
   const settings = useTradeStore((state) => state.settings)
@@ -46,6 +71,37 @@ export function SettingsPanel() {
   const [isClearing, setIsClearing] = useState(false)
   const [isImporting, setIsImporting] = useState(false)
 
+  // --- Local draft state for numeric inputs -------------------------------
+  // Stored as strings so the input can be empty or mid-edit (e.g. "0.", "-")
+  // without fighting React's controlled-input value. Parsed on demand.
+  const toStringDraft = (s: UserSettings) => ({
+    accountSize: String(s.accountSize),
+    monthlyProfitTarget: String(s.monthlyProfitTarget),
+    dailyRiskLimit: String(s.dailyRiskLimit),
+    weeklyRiskLimit: String(s.weeklyRiskLimit),
+    maxTradesPerDay: String(s.maxTradesPerDay),
+    minRiskReward: String(s.minRiskReward),
+    streakTarget: String(s.streakTarget),
+  })
+
+  const [draft, setDraft] = useState<Record<NumericSettingKey, string>>(() =>
+    toStringDraft(settings)
+  )
+
+  // Keep local drafts in sync if settings change from elsewhere
+  // (e.g. after import, or load from server).
+  useEffect(() => {
+    setDraft(toStringDraft(settings))
+  }, [
+    settings.accountSize,
+    settings.monthlyProfitTarget,
+    settings.dailyRiskLimit,
+    settings.weeklyRiskLimit,
+    settings.maxTradesPerDay,
+    settings.minRiskReward,
+    settings.streakTarget,
+  ])
+
   const handleSettingChange = async <K extends keyof UserSettings>(
     key: K,
     value: UserSettings[K]
@@ -56,6 +112,50 @@ export function SettingsPanel() {
     } else {
       toast.error('Failed to save settings')
     }
+  }
+
+  // Debounced persist — only fires 400ms after the user stops typing
+  const debouncedSave = useDebouncedCallback(
+    <K extends NumericSettingKey>(key: K, value: UserSettings[K]) => {
+      handleSettingChange(key, value)
+    },
+    400
+  )
+
+  const parseNumeric = (key: NumericSettingKey, rawValue: string): number => {
+    return key === 'maxTradesPerDay' || key === 'streakTarget'
+      ? parseInt(rawValue, 10)
+      : parseFloat(rawValue)
+  }
+
+  // Updates local draft immediately (so the input feels responsive — the
+  // user can freely type, clear, or backspace) and only schedules the
+  // debounced save when the current value is fully valid per the server's
+  // bounds. This avoids firing a request mid-typing (e.g. a momentary "0"
+  // while clearing a min(1) field) that would just 400.
+  const handleNumericChange = (key: NumericSettingKey, rawValue: string) => {
+    setDraft((prev) => ({ ...prev, [key]: rawValue }))
+
+    const parsed = parseNumeric(key, rawValue)
+    if (Number.isNaN(parsed)) return // empty/incomplete — wait for more input
+
+    const { min, max } = NUMERIC_BOUNDS[key]
+    if (parsed < min || parsed > max) return // out of range mid-edit — wait
+
+    debouncedSave(key, parsed)
+  }
+
+  // On blur, snap any empty or out-of-range value back to a valid one so
+  // the field never gets stuck invalid, and persist immediately.
+  const handleNumericBlur = (key: NumericSettingKey, fallback: number) => {
+    const parsed = parseNumeric(key, draft[key])
+    const { min, max } = NUMERIC_BOUNDS[key]
+    const value = Number.isNaN(parsed)
+      ? fallback
+      : Math.min(max, Math.max(min, parsed))
+
+    setDraft((prev) => ({ ...prev, [key]: String(value) }))
+    debouncedSave(key, value)
   }
 
   const handleExport = () => {
@@ -243,10 +343,9 @@ export function SettingsPanel() {
                 type="number"
                 min="0"
                 step="100"
-                value={settings.accountSize}
-                onChange={(e) => {
-                  handleSettingChange('accountSize', parseFloat(e.target.value) || 0)
-                }}
+                value={draft.accountSize}
+                onChange={(e) => handleNumericChange('accountSize', e.target.value)}
+                onBlur={() => handleNumericBlur('accountSize', 0)}
                 className="bg-input/50 border-border/50"
               />
               <p className="text-xs text-muted-foreground">
@@ -261,10 +360,9 @@ export function SettingsPanel() {
                 type="number"
                 min="0"
                 step="50"
-                value={settings.monthlyProfitTarget}
-                onChange={(e) => {
-                  handleSettingChange('monthlyProfitTarget', parseFloat(e.target.value) || 0)
-                }}
+                value={draft.monthlyProfitTarget}
+                onChange={(e) => handleNumericChange('monthlyProfitTarget', e.target.value)}
+                onBlur={() => handleNumericBlur('monthlyProfitTarget', 0)}
                 className="bg-input/50 border-border/50"
               />
               <p className="text-xs text-muted-foreground">
@@ -300,10 +398,9 @@ export function SettingsPanel() {
                 min="1"
                 max="100"
                 step="0.5"
-                value={settings.dailyRiskLimit}
-                onChange={(e) => {
-                  handleSettingChange('dailyRiskLimit', parseFloat(e.target.value) || 5)
-                }}
+                value={draft.dailyRiskLimit}
+                onChange={(e) => handleNumericChange('dailyRiskLimit', e.target.value)}
+                onBlur={() => handleNumericBlur('dailyRiskLimit', 5)}
                 className="bg-input/50 border-border/50"
               />
               <p className="text-xs text-muted-foreground">
@@ -322,10 +419,9 @@ export function SettingsPanel() {
                 min="1"
                 max="100"
                 step="0.5"
-                value={settings.weeklyRiskLimit}
-                onChange={(e) => {
-                  handleSettingChange('weeklyRiskLimit', parseFloat(e.target.value) || 15)
-                }}
+                value={draft.weeklyRiskLimit}
+                onChange={(e) => handleNumericChange('weeklyRiskLimit', e.target.value)}
+                onBlur={() => handleNumericBlur('weeklyRiskLimit', 15)}
                 className="bg-input/50 border-border/50"
               />
               <p className="text-xs text-muted-foreground">
@@ -343,10 +439,9 @@ export function SettingsPanel() {
                 type="number"
                 min="1"
                 max="50"
-                value={settings.maxTradesPerDay}
-                onChange={(e) => {
-                  handleSettingChange('maxTradesPerDay', parseInt(e.target.value) || 5)
-                }}
+                value={draft.maxTradesPerDay}
+                onChange={(e) => handleNumericChange('maxTradesPerDay', e.target.value)}
+                onBlur={() => handleNumericBlur('maxTradesPerDay', 5)}
                 className="bg-input/50 border-border/50"
               />
             </div>
@@ -362,14 +457,13 @@ export function SettingsPanel() {
                 min="0.5"
                 max="10"
                 step="0.1"
-                value={settings.minRiskReward}
-                onChange={(e) => {
-                  handleSettingChange('minRiskReward', parseFloat(e.target.value) || 2)
-                }}
+                value={draft.minRiskReward}
+                onChange={(e) => handleNumericChange('minRiskReward', e.target.value)}
+                onBlur={() => handleNumericBlur('minRiskReward', 2)}
                 className="bg-input/50 border-border/50"
               />
               <p className="text-xs text-muted-foreground">
-                Target at least {settings.minRiskReward}:1 on every trade
+                Target at least {draft.minRiskReward}:1 on every trade
               </p>
             </div>
           </div>
@@ -384,10 +478,9 @@ export function SettingsPanel() {
               type="number"
               min="1"
               max="365"
-              value={settings.streakTarget}
-              onChange={(e) => {
-                handleSettingChange('streakTarget', parseInt(e.target.value) || 7)
-              }}
+              value={draft.streakTarget}
+              onChange={(e) => handleNumericChange('streakTarget', e.target.value)}
+              onBlur={() => handleNumericBlur('streakTarget', 7)}
               className="bg-input/50 border-border/50 max-w-[200px]"
             />
             <p className="text-xs text-muted-foreground">
